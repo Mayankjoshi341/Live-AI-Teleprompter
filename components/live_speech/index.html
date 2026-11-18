@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live microphone transcription</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body {
+      padding: 8px 2px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #f7f9fc;
+    }
+    .panel {
+      border: 1px solid rgba(180,190,205,.30);
+      border-radius: 16px;
+      padding: 14px;
+      background: #202328;
+      color: #f7f9fc;
+    }
+    .topline { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+    .status { color:#eef2f7; font-size:13px; font-weight:700; display:flex; align-items:center; gap:8px; }
+    .dot { width:9px; height:9px; border-radius:50%; background:#939ba7; display:inline-block; flex:0 0 auto; }
+    .dot.live { background:#31c48d; box-shadow:0 0 0 4px rgba(49,196,141,.16); }
+    .language { color:#aeb8c6; font-size:11px; white-space:nowrap; }
+    button {
+      appearance:none; border:0; border-radius:12px; width:100%; min-height:52px;
+      padding:12px 16px; font-size:16px; font-weight:750; cursor:pointer;
+      background:#13845f; color:#ffffff; transition:filter .12s ease, transform .12s ease;
+    }
+    button:hover { filter:brightness(1.08); }
+    button:active { transform:scale(.99); }
+    button.stop { background:#b83d48; }
+    button:disabled { opacity:.58; cursor:wait; }
+    .transcript {
+      margin-top:12px; min-height:88px; max-height:150px; overflow:auto;
+      border-radius:11px; padding:13px 14px; border:1px solid rgba(180,190,205,.28);
+      background:#171a1f; color:#f7f9fc; font-size:16px; line-height:1.55;
+      overflow-wrap:anywhere; white-space:pre-wrap;
+    }
+    .placeholder { color:#aeb8c6; }
+    .interim { color:#b9d9ff; opacity:1; }
+    .hint { color:#b7c0cc; margin-top:9px; font-size:12px; line-height:1.45; }
+    .error { color:#ff8d95; }
+    @media (max-width:480px) {
+      .panel { padding:12px; }
+      .transcript { font-size:17px; min-height:96px; }
+      button { min-height:56px; font-size:17px; }
+      .language { font-size:10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="topline">
+      <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">Microphone is off</span></div>
+      <div class="language">English · live transcription</div>
+    </div>
+    <button id="toggleButton" type="button">🎙 Start listening</button>
+    <div id="transcript" class="transcript" aria-live="polite"><span class="placeholder">Your live transcript will appear here.</span></div>
+    <div id="hint" class="hint">Press Start when the question begins. Press Stop when the interviewer finishes.</div>
+  </div>
+
+  <script>
+    (() => {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const button = document.getElementById("toggleButton");
+      const statusText = document.getElementById("statusText");
+      const statusDot = document.getElementById("statusDot");
+      const transcriptBox = document.getElementById("transcript");
+      const hint = document.getElementById("hint");
+
+      let recognition = null;
+      let mediaStream = null;
+      let mediaRecorder = null;
+      let audioChunks = [];
+      let audioBase64 = "";
+      let audioMimeType = "";
+      let isListening = false;
+      let shouldRestart = false;
+      let stopRequested = false;
+      let recognitionEnded = true;
+      let recorderEnded = true;
+      let finalText = "";
+      let interimText = "";
+      let terminalError = "";
+      let sentForThisRecording = false;
+      let stopSafetyTimer = null;
+      let speechUnavailable = !SpeechRecognition;
+
+      function postValue(payload) {
+        // Streamlit's JSON component protocol expects a JSON value, not a JSON string.
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          dataType: "json",
+          value: payload
+        }, "*");
+      }
+
+      function setStatus(label, live) {
+        statusText.textContent = label;
+        statusDot.classList.toggle("live", Boolean(live));
+      }
+
+      function renderTranscript() {
+        const finalPart = finalText.trim();
+        const interimPart = interimText.trim();
+        transcriptBox.innerHTML = "";
+        if (!finalPart && !interimPart) {
+          const placeholder = document.createElement("span");
+          placeholder.className = "placeholder";
+          placeholder.textContent = isListening ? "Listening for the question…" : "Your live transcript will appear here.";
+          transcriptBox.appendChild(placeholder);
+          return;
+        }
+        if (finalPart) {
+          const finalSpan = document.createElement("span");
+          finalSpan.textContent = finalPart;
+          transcriptBox.appendChild(finalSpan);
+        }
+        if (interimPart) {
+          const interimSpan = document.createElement("span");
+          interimSpan.className = "interim";
+          interimSpan.textContent = (finalPart ? " " : "") + interimPart;
+          transcriptBox.appendChild(interimSpan);
+        }
+        transcriptBox.scrollTop = transcriptBox.scrollHeight;
+      }
+
+      function setListeningUI(active) {
+        isListening = active;
+        button.textContent = active ? "■ Stop listening" : "🎙 Start listening";
+        button.classList.toggle("stop", active);
+        setStatus(active ? "Listening now" : "Microphone is off", active);
+        renderTranscript();
+      }
+
+      function releaseMicrophone() {
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(track => track.stop());
+          mediaStream = null;
+        }
+      }
+
+      function maybeFinish() {
+        if (stopRequested && recognitionEnded && recorderEnded) finishAndSend();
+      }
+
+      async function blobToBase64(blob) {
+        const buffer = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = "";
+        const batchSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += batchSize) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + batchSize));
+        }
+        return btoa(binary);
+      }
+
+      function finishAndSend() {
+        if (sentForThisRecording) return;
+        sentForThisRecording = true;
+        if (stopSafetyTimer) {
+          window.clearTimeout(stopSafetyTimer);
+          stopSafetyTimer = null;
+        }
+        button.disabled = false;
+        // Prefer finalized browser results. Interim-only text is shown as a diagnostic
+        // fallback, while the original audio is sent to Gemini for a reliable transcript.
+        const hasFinalTranscript = Boolean(finalText.trim());
+        const transcript = (finalText.trim() || interimText.trim()).replace(/\s+/g, " ").trim();
+        releaseMicrophone();
+        setListeningUI(false);
+        setStatus("Question captured", false);
+        if (transcript) {
+          hint.textContent = "Transcript captured. Generating your answer…";
+        } else if (audioBase64) {
+          hint.textContent = "Audio captured. Transcribing it with Gemini…";
+        } else {
+          hint.textContent = terminalError || "No speech was captured. Please try again.";
+          hint.classList.add("error");
+        }
+        postValue({
+          event_id: String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8),
+          transcript: transcript,
+          is_final_transcript: hasFinalTranscript,
+          audio_base64: hasFinalTranscript ? "" : audioBase64,
+          audio_mime_type: audioMimeType || "audio/webm",
+          error: terminalError,
+          status: "stopped"
+        });
+      }
+
+      function startRecorder(stream) {
+        if (!window.MediaRecorder) return false;
+        const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+        let options = {};
+        for (const mime of candidates) {
+          if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(mime)) {
+            options = { mimeType: mime };
+            break;
+          }
+        }
+        try {
+          mediaRecorder = new MediaRecorder(stream, options);
+          audioChunks = [];
+          audioBase64 = "";
+          audioMimeType = mediaRecorder.mimeType || options.mimeType || "audio/webm";
+          recorderEnded = false;
+          mediaRecorder.ondataavailable = event => {
+            if (event.data && event.data.size > 0) audioChunks.push(event.data);
+          };
+          mediaRecorder.onstop = async () => {
+            try {
+              const blob = new Blob(audioChunks, { type: audioMimeType });
+              // Keep an audio fallback whenever Web Speech has not produced a final result.
+              if (blob.size > 0 && !finalText.trim()) {
+                audioBase64 = await blobToBase64(blob);
+              }
+            } catch (error) {
+              terminalError = "Could not prepare the recorded audio for transcription.";
+            }
+            recorderEnded = true;
+            maybeFinish();
+          };
+          mediaRecorder.onerror = () => {
+            terminalError = "The microphone recording failed. Please try again.";
+            recorderEnded = true;
+            maybeFinish();
+          };
+          mediaRecorder.start(250);
+          return true;
+        } catch (error) {
+          mediaRecorder = null;
+          recorderEnded = true;
+          return false;
+        }
+      }
+
+      function createRecognition() {
+        const rec = new SpeechRecognition();
+        rec.lang = "en-US";
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.maxAlternatives = 1;
+
+        rec.onstart = () => {
+          setListeningUI(true);
+          terminalError = "";
+        };
+
+        rec.onresult = event => {
+          interimText = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+            const alternative = result && result[0];
+            const phrase = (alternative && alternative.transcript ? alternative.transcript : "").trim();
+            if (!phrase) continue;
+            if (result.isFinal) {
+              finalText = (finalText + " " + phrase).replace(/\s+/g, " ").trim();
+            } else {
+              interimText += (interimText ? " " : "") + phrase;
+            }
+          }
+          renderTranscript();
+        };
+
+        rec.onerror = event => {
+          const code = event.error || "unknown";
+          if (code === "no-speech" && shouldRestart) return;
+          if (code === "aborted" && !shouldRestart) return;
+          const messages = {
+            "not-allowed": "Speech recognition permission was denied. Check this website’s microphone permission in your browser settings.",
+            "service-not-allowed": "This browser blocks its speech-recognition service. The audio fallback will be used when available.",
+            "audio-capture": "The browser could not access the microphone. Check the site permission and whether another app is using it.",
+            "network": "The live speech service lost its network connection. The recorded-audio fallback will be used if available.",
+            "language-not-supported": "This device does not support English live recognition. The recorded-audio fallback will be used if available."
+          };
+          terminalError = messages[code] || ("Speech recognition error: " + code);
+          hint.textContent = terminalError;
+          hint.classList.add("error");
+          speechUnavailable = true;
+          shouldRestart = false;
+          if (!stopRequested && mediaRecorder && mediaRecorder.state === "recording") {
+            setStatus("Recording audio for fallback", true);
+          }
+        };
+
+        rec.onend = () => {
+          if (shouldRestart && !stopRequested) {
+            window.setTimeout(() => {
+              if (!shouldRestart || !recognition) return;
+              try { recognition.start(); }
+              catch (error) { /* A short browser restart race is harmless. */ }
+            }, 220);
+            return;
+          }
+          recognitionEnded = true;
+          if (stopRequested) maybeFinish();
+        };
+        return rec;
+      }
+
+      async function startListening() {
+        if (isListening || button.disabled) return;
+        const isLocalhost = ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+        if (!window.isSecureContext && !isLocalhost) {
+          terminalError = "Microphone access requires HTTPS on a phone. Open the deployed HTTPS link, not an http:// local-network address.";
+          hint.textContent = terminalError;
+          hint.classList.add("error");
+          postValue({ event_id: String(Date.now()), transcript: "", error: terminalError, status: "permission_error" });
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          terminalError = "This browser cannot request microphone access. Open the app in Chrome or Safari using HTTPS.";
+          hint.textContent = terminalError;
+          hint.classList.add("error");
+          return;
+        }
+
+        finalText = "";
+        interimText = "";
+        terminalError = "";
+        audioBase64 = "";
+        audioMimeType = "";
+        audioChunks = [];
+        sentForThisRecording = false;
+        stopRequested = false;
+        shouldRestart = false;
+        recognitionEnded = !SpeechRecognition;
+        recorderEnded = true;
+        speechUnavailable = !SpeechRecognition;
+        hint.classList.remove("error");
+        button.disabled = true;
+        setStatus("Requesting microphone permission…", false);
+        hint.textContent = "Your browser should ask for microphone permission. Choose Allow.";
+
+        try {
+          // Explicit getUserMedia call makes the browser permission prompt visible on user tap.
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+          });
+        } catch (error) {
+          button.disabled = false;
+          const permissionMessages = {
+            "NotAllowedError": "Microphone permission is blocked. Tap the site icon beside the address, open Site settings, set Microphone to Allow, then reload this page.",
+            "PermissionDeniedError": "Microphone permission is blocked. Allow microphone access in your browser/site settings and reload.",
+            "NotFoundError": "No microphone was found on this device.",
+            "NotReadableError": "The microphone is busy or unavailable. Close other apps using it and try again.",
+            "SecurityError": "Microphone access requires a secure HTTPS page (localhost is allowed for local testing)."
+          };
+          terminalError = permissionMessages[error.name] || ("Microphone access failed: " + error.name + (error.message ? " — " + error.message : ""));
+          hint.textContent = terminalError;
+          hint.classList.add("error");
+          setStatus("Microphone permission needed", false);
+          postValue({ event_id: String(Date.now()), transcript: "", error: terminalError, status: "permission_error" });
+          return;
+        }
+
+        button.disabled = false;
+        const recorderAvailable = startRecorder(mediaStream);
+        if (!SpeechRecognition && !recorderAvailable) {
+          terminalError = "This browser supports neither live speech recognition nor audio recording. Try the latest Chrome or Safari.";
+          hint.textContent = terminalError;
+          hint.classList.add("error");
+          setStatus("Speech capture unavailable", false);
+          releaseMicrophone();
+          return;
+        }
+
+        setListeningUI(true);
+        if (!SpeechRecognition) {
+          hint.textContent = "This browser has no live transcript feature. Speak your question, then Stop; Gemini will transcribe the recording.";
+          setStatus("Recording · transcription after Stop", true);
+          return;
+        }
+
+        recognition = createRecognition();
+        shouldRestart = true;
+        recognitionEnded = false;
+        try {
+          recognition.start();
+          if (!recorderAvailable) {
+            hint.textContent = "Live transcription is active. If this browser stops recognizing, try Chrome or Edge.";
+          } else {
+            hint.textContent = "Live transcription is active. A short audio backup is kept in case the browser returns no transcript.";
+          }
+        } catch (error) {
+          shouldRestart = false;
+          recognitionEnded = true;
+          speechUnavailable = true;
+          if (recorderAvailable) {
+            setStatus("Recording audio for Gemini transcription", true);
+            hint.textContent = "Live recognition could not start. Your audio is still being recorded; press Stop to transcribe with Gemini.";
+            hint.classList.add("error");
+          } else {
+            terminalError = "Live speech recognition could not start. Check microphone permission and try again.";
+            hint.textContent = terminalError;
+            hint.classList.add("error");
+            setListeningUI(false);
+            releaseMicrophone();
+          }
+        }
+      }
+
+      function stopListening() {
+        if (!isListening || stopRequested) return;
+        stopRequested = true;
+        shouldRestart = false;
+        setStatus("Finishing question…", false);
+        button.disabled = true;
+        hint.classList.remove("error");
+        hint.textContent = "Finishing the transcript and preparing your answer…";
+
+        if (recognition && !speechUnavailable) {
+          recognitionEnded = false;
+          try { recognition.stop(); }
+          catch (error) { recognitionEnded = true; }
+        } else {
+          recognitionEnded = true;
+        }
+
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          recorderEnded = false;
+          try { mediaRecorder.stop(); }
+          catch (error) { recorderEnded = true; }
+        } else {
+          recorderEnded = true;
+        }
+
+        stopSafetyTimer = window.setTimeout(() => {
+          if (!recognitionEnded) recognitionEnded = true;
+          if (!recorderEnded) {
+            try { if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop(); } catch (error) {}
+            recorderEnded = true;
+          }
+          maybeFinish();
+        }, 6000);
+        maybeFinish();
+      }
+
+      button.addEventListener("click", () => {
+        if (isListening) stopListening();
+        else startListening();
+      });
+
+      window.addEventListener("message", event => {
+        if (event.data && event.data.type === "streamlit:render") {
+          // Keep the current capture alive during Streamlit rerenders.
+        }
+      });
+
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 278 }, "*");
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+Python Basics
+
+Python is a high-level, general-purpose programming language. It is interpreted and dynamically typed. Python emphasizes readable syntax and supports procedural, object-oriented, and functional programming styles.
+
+Dynamic typing means that a variable does not need an explicit type declaration. The type is associated with the value at runtime. For example, a variable can refer to an integer and later refer to a string.
+
+Python is commonly used for web development, automation, data analysis, machine learning, scripting, and backend development.
+
+A list is an ordered, mutable collection. A tuple is an ordered, immutable collection. A set stores unique elements. A dictionary stores key-value pairs.
+
+A function is defined with the def keyword. Functions can accept parameters and return values. A lambda expression creates a small anonymous function.
+
+A class is a blueprint for creating objects. An object is an instance of a class. Inheritance allows a class to reuse or extend behavior from another class. Encapsulation groups data and methods together and controls access to internal state. Polymorphism allows different object types to respond to the same interface in different ways.
+
+An exception is an error or unusual condition that interrupts normal program flow. Python handles exceptions with try and except blocks. A finally block runs whether an exception occurs or not.
+
+A module is a Python file that can be imported. A package organizes related modules, usually in a directory. pip is the package installer commonly used to install third-party Python packages.
